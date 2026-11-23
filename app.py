@@ -8,14 +8,35 @@ import altair as alt
 
 
 # ----------------------------------------------------------------------
-# 1. Page Configuration & Central Google Sheet Setup
+# 1. Page Configuration & Central Data Sources
 # ----------------------------------------------------------------------
 st.set_page_config(page_title="ACKD Engineering Resource Planner", layout="wide")
 st.title("📊 Dynamic Engineering Resource Planner - ACKD")
 
-# Central Google Sheet ID (ACKD_Resource_Planner_DB)
-SPREADSHEET_ID = "1ksIh1yt0_zeOWszW1fk5zQdZSL5ytaKJ1-IMODmtjBY"
-SHEET_EDIT_URL = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit"
+MASTER_SHEET_ID = "1ksIh1yt0_zeOWszW1fk5zQdZSL5ytaKJ1-IMODmtjBY"
+
+PM_SHEETS = {
+    "Dr. Hatem Al-Sayed": {
+        "sheet_id": "1N-FtQn7a0lWQqoru0dZauugW-afe78l5rH0HW6MW1L4",
+        "pm_label": "Dr. Hatem Al-Sayed",
+    },
+    "Eng. Ali Athamneh": {
+        "sheet_id": "1eK-aTlLHhsDWGJv4Afelc-A3IYcLuKy53QXaAoxcUlE",
+        "pm_label": "Eng. Ali Athamneh",
+    },
+    "Eng. Mohamed Gamal": {
+        "sheet_id": "1UdKXCiEFStLYBHHxfXfCHWF_4eDuCe-K8x-HMt2DuOA",
+        "pm_label": "Eng. Mohamed Gamal",
+    },
+    "Eng. Saed Abu Taha": {
+        "sheet_id": "1H8eOnYL_okvUmzouvSTm1hMJMdikrHJbX77-l-sKc7E",
+        "pm_label": "Eng. Saed Abu Taha",
+    },
+    "Eng. Hakem Al-Omoush": {
+        "sheet_id": "1MYYCSMOoWIjutD6wso3K4KiwQrI_bF6aE9BGwzBw6Cs",
+        "pm_label": "Eng. Hakem Al-Omoush",
+    },
+}
 
 # Working week: Sunday to Thursday (Friday & Saturday are the weekend)
 NP_WEEKMASK = "1111001"
@@ -25,69 +46,22 @@ DEFAULT_EFFICIENCY_PCT = 80.0
 
 
 def build_sheet_csv_url(sheet_id: str, sheet_name: str) -> str:
-    """Build public CSV export URL for a specific Google Sheet tab."""
     return (
         f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq"
         f"?tqx=out:csv&sheet={quote(sheet_name)}"
     )
 
 
+def build_edit_url(sheet_id: str) -> str:
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit"
+
+
 def parse_dates(series: pd.Series) -> pd.Series:
-    """Parse mixed date formats safely into python date objects."""
     try:
         parsed = pd.to_datetime(series, errors="coerce", format="mixed")
     except (TypeError, ValueError):
         parsed = pd.to_datetime(series, errors="coerce")
     return parsed.dt.date
-
-
-# ----------------------------------------------------------------------
-# 2. Data Loaders (No API Required)
-# ----------------------------------------------------------------------
-@st.cache_data(ttl=60, show_spinner="Loading Projects, Teams, and Tasks from Google Sheets...")
-def load_planner_data(sheet_id: str):
-    projects_url = build_sheet_csv_url(sheet_id, "Projects")
-    teams_url = build_sheet_csv_url(sheet_id, "Team_Capacity")
-    tasks_url = build_sheet_csv_url(sheet_id, "Tasks")
-
-    # 1. Projects
-    projects_df = pd.read_csv(projects_url)
-    projects_df.columns = projects_df.columns.astype(str).str.strip()
-    projects_df = projects_df.dropna(how="all").reset_index(drop=True)
-    if "Target_Delivery_Date" in projects_df.columns:
-        projects_df["Target_Delivery_Date"] = parse_dates(projects_df["Target_Delivery_Date"])
-
-    # 2. Team Capacity
-    teams_df = pd.read_csv(teams_url)
-    teams_df.columns = teams_df.columns.astype(str).str.strip()
-    teams_df = teams_df.dropna(how="all").reset_index(drop=True)
-    for num_col, default_val in [
-        ("Engineers_Count", 1),
-        ("Hours_Per_Day", DEFAULT_HOURS_PER_DAY),
-        ("Efficiency_Pct", DEFAULT_EFFICIENCY_PCT),
-    ]:
-        if num_col in teams_df.columns:
-            teams_df[num_col] = pd.to_numeric(teams_df[num_col], errors="coerce").fillna(default_val)
-
-    # 3. Tasks
-    tasks_df = pd.read_csv(tasks_url)
-    tasks_df.columns = tasks_df.columns.astype(str).str.strip()
-    # Keep only rows that actually have a Project_Code or Task_Name
-    key_cols = [c for c in ["Project_Code", "Task_Name", "Team_Name"] if c in tasks_df.columns]
-    if key_cols:
-        tasks_df = tasks_df.dropna(subset=key_cols, how="all").reset_index(drop=True)
-    else:
-        tasks_df = tasks_df.dropna(how="all").reset_index(drop=True)
-
-    for d_col in ["Start_Date", "End_Date", "Project_Deadline"]:
-        if d_col in tasks_df.columns:
-            tasks_df[d_col] = parse_dates(tasks_df[d_col])
-
-    for n_col in ["Engineers_Assigned", "Allocated_Hours"]:
-        if n_col in tasks_df.columns:
-            tasks_df[n_col] = pd.to_numeric(tasks_df[n_col], errors="coerce")
-
-    return projects_df, teams_df, tasks_df
 
 
 def compute_workdays(s_date, e_date) -> int:
@@ -103,6 +77,85 @@ def compute_workdays(s_date, e_date) -> int:
     return max(wd, 1) if s_date == e_date else wd
 
 
+# ----------------------------------------------------------------------
+# 2. Auto-Sync Data Loader (Master + All PM Sheets)
+# ----------------------------------------------------------------------
+@st.cache_data(ttl=60, show_spinner="Syncing Projects, Teams, and PM Task Sheets...")
+def load_all_synced_data(master_id: str, pm_sheets_map: dict):
+    sync_status = []
+
+    # 1. Projects
+    projects_df = pd.read_csv(build_sheet_csv_url(master_id, "Projects"))
+    projects_df.columns = projects_df.columns.astype(str).str.strip()
+    projects_df = projects_df.dropna(how="all").reset_index(drop=True)
+    if "Target_Delivery_Date" in projects_df.columns:
+        projects_df["Target_Delivery_Date"] = parse_dates(projects_df["Target_Delivery_Date"])
+
+    # 2. Team Capacity
+    teams_df = pd.read_csv(build_sheet_csv_url(master_id, "Team_Capacity"))
+    teams_df.columns = teams_df.columns.astype(str).str.strip()
+    teams_df = teams_df.dropna(how="all").reset_index(drop=True)
+    for col, default_val in [
+        ("Engineers_Count", 1),
+        ("Hours_Per_Day", DEFAULT_HOURS_PER_DAY),
+        ("Efficiency_Pct", DEFAULT_EFFICIENCY_PCT),
+    ]:
+        if col in teams_df.columns:
+            teams_df[col] = pd.to_numeric(teams_df[col], errors="coerce").fillna(default_val)
+
+    # 3. Tasks from each PM Sheet
+    all_task_frames = []
+    for pm_key, cfg in pm_sheets_map.items():
+        pm_id = cfg["sheet_id"]
+        pm_name = cfg["pm_label"]
+        try:
+            df_pm = pd.read_csv(build_sheet_csv_url(pm_id, "Tasks"))
+            df_pm.columns = df_pm.columns.astype(str).str.strip()
+            key_cols = [c for c in ["Project_Code", "Task_Name", "Team_Name"] if c in df_pm.columns]
+            if key_cols:
+                df_pm = df_pm.dropna(subset=key_cols, how="all").reset_index(drop=True)
+            else:
+                df_pm = df_pm.dropna(how="all").reset_index(drop=True)
+
+            df_pm["PM_Name"] = pm_name
+            all_task_frames.append(df_pm)
+            sync_status.append({"PM": pm_name, "Tasks Loaded": len(df_pm), "Status": "Synced"})
+        except Exception as exc:
+            sync_status.append({"PM": pm_name, "Tasks Loaded": 0, "Status": f"Error: {exc}"})
+
+    if all_task_frames:
+        tasks_df = pd.concat(all_task_frames, ignore_index=True)
+    else:
+        tasks_df = pd.DataFrame(
+            columns=[
+                "Task_ID",
+                "Project_Code",
+                "Project_Name",
+                "PM_Name",
+                "Project_Deadline",
+                "Task_Name",
+                "Team_Name",
+                "Start_Date",
+                "End_Date",
+                "Engineers_Assigned",
+                "Allocated_Hours",
+                "Coordination_Status",
+                "PM_Notes",
+                "Team_Notes",
+            ]
+        )
+
+    for d_col in ["Start_Date", "End_Date", "Project_Deadline"]:
+        if d_col in tasks_df.columns:
+            tasks_df[d_col] = parse_dates(tasks_df[d_col])
+
+    for n_col in ["Engineers_Assigned", "Allocated_Hours"]:
+        if n_col in tasks_df.columns:
+            tasks_df[n_col] = pd.to_numeric(tasks_df[n_col], errors="coerce")
+
+    return projects_df, teams_df, tasks_df, pd.DataFrame(sync_status)
+
+
 def prepare_tasks_df(
     raw_tasks: pd.DataFrame,
     projects_df: pd.DataFrame,
@@ -113,12 +166,10 @@ def prepare_tasks_df(
     if df.empty:
         return df
 
-    # Enrich missing Project_Name / PM_Name / Project_Deadline from Projects master if needed
     if not projects_df.empty and "Project_Code" in df.columns and "Project_Code" in projects_df.columns:
         proj_lookup = projects_df.drop_duplicates(subset=["Project_Code"]).set_index("Project_Code")
         for target_col, src_col in [
             ("Project_Name", "Project_Name"),
-            ("PM_Name", "PM_Name"),
             ("Project_Deadline", "Target_Delivery_Date"),
         ]:
             if src_col in proj_lookup.columns:
@@ -135,7 +186,6 @@ def prepare_tasks_df(
 
     df["WorkDays"] = [compute_workdays(s, e) for s, e in zip(df["Start_Date"], df["End_Date"])]
 
-    # Calculate Allocated_Hours if missing/zero and Engineers_Assigned is entered (for live What-If edits)
     calc_hours = []
     for _, row in df.iterrows():
         hrs = row.get("Allocated_Hours")
@@ -149,32 +199,31 @@ def prepare_tasks_df(
             calc_hours.append(0.0)
     df["Effective_Hours"] = calc_hours
 
-    # Schedule risk flag against Project_Deadline
     today = datetime.date.today()
-    status_flags = []
+    health_flags = []
     for _, row in df.iterrows():
-        status_str = str(row.get("Coordination_Status", ""))
+        status_str = str(row.get("Coordination_Status", "")).lower()
         e_date = row.get("End_Date")
         deadline = row.get("Project_Deadline")
-        if "مكتمل" in status_str:
-            status_flags.append("✅ مكتمل")
+        if "completed" in status_str or "مكتمل" in status_str:
+            health_flags.append("✅ Completed")
         elif pd.notnull(deadline) and pd.notnull(e_date) and e_date > deadline:
-            status_flags.append("🚨 يتجاوز تسليم المشروع")
+            health_flags.append("🚨 Exceeds Project Delivery")
         elif pd.notnull(e_date) and e_date < today:
-            status_flags.append("⚠️ متأخر عن اليوم")
+            health_flags.append("⚠️ Past Due")
         else:
-            status_flags.append("🟢 ضمن الجدول")
-    df["Schedule_Health"] = status_flags
+            health_flags.append("🟢 On Track")
+    df["Schedule_Status"] = health_flags
 
     return df
 
 
 # ----------------------------------------------------------------------
-# 3. Gantt Chart Renderer
+# 3. Gantt Timeline Chart
 # ----------------------------------------------------------------------
-def render_gantt_chart(df: pd.DataFrame, label_mode: str = "project_task", hide_completed: bool = False):
+def render_gantt_chart(df: pd.DataFrame, color_by: str = "Team_Name", hide_completed: bool = False):
     if df.empty:
-        st.info("لا توجد مهام مطابقة لمعايير التصفية الحالية.")
+        st.info("No tasks match the current selection.")
         return
 
     gantt_df = df.copy()
@@ -184,38 +233,29 @@ def render_gantt_chart(df: pd.DataFrame, label_mode: str = "project_task", hide_
     gantt_df = gantt_df[gantt_df["End"] >= gantt_df["Start"]]
 
     if hide_completed and "Coordination_Status" in gantt_df.columns:
-        gantt_df = gantt_df[~gantt_df["Coordination_Status"].astype(str).str.contains("مكتمل", na=False)]
+        mask_comp = gantt_df["Coordination_Status"].astype(str).str.lower().str.contains("completed|مكتمل", na=False)
+        gantt_df = gantt_df[~mask_comp]
 
     if gantt_df.empty:
-        st.info("لا توجد مهام نشطة أو قادمة بتواريخ صالحة للعرض.")
+        st.info("No active or upcoming tasks with valid dates to display.")
         return
 
-    if label_mode == "team_task":
-        gantt_df["RowLabel"] = (
-            gantt_df["Project_Code"].fillna("").astype(str)
-            + " | "
-            + gantt_df["Task_Name"].fillna("Unnamed Task").astype(str)
-        )
-        color_col = "PM_Name"
-    else:
-        gantt_df["RowLabel"] = (
-            gantt_df["Project_Code"].fillna("").astype(str)
-            + " — "
-            + gantt_df["Task_Name"].fillna("Unnamed Task").astype(str)
-            + " ("
-            + gantt_df["Team_Name"].fillna("").astype(str)
-            + ")"
-        )
-        color_col = "Team_Name"
+    gantt_df["RowLabel"] = (
+        gantt_df["Project_Code"].fillna("").astype(str)
+        + " — "
+        + gantt_df["Task_Name"].fillna("Task").astype(str)
+        + " ["
+        + gantt_df["Team_Name"].fillna("").astype(str)
+        + "]"
+    )
 
-    # Ensure unique labels on Y-axis
     if gantt_df["RowLabel"].duplicated().any():
         seen = {}
         unique_labels = []
         for lbl in gantt_df["RowLabel"]:
             cnt = seen.get(lbl, 0) + 1
             seen[lbl] = cnt
-            unique_labels.append(f"{lbl} #{cnt}" if cnt > 1 else lbl)
+            unique_labels.append(f"{lbl} ({cnt})" if cnt > 1 else lbl)
         gantt_df["RowLabel"] = unique_labels
 
     gantt_df["EndPlus"] = gantt_df["End"] + pd.Timedelta(days=1)
@@ -235,20 +275,20 @@ def render_gantt_chart(df: pd.DataFrame, label_mode: str = "project_task", hide_
     tooltips = [
         alt.Tooltip("Project_Code:N", title="Project Code"),
         alt.Tooltip("Project_Name:N", title="Project Name"),
-        alt.Tooltip("PM_Name:N", title="PM"),
+        alt.Tooltip("PM_Name:N", title="Project Manager"),
         alt.Tooltip("Task_Name:N", title="Task"),
-        alt.Tooltip("Team_Name:N", title="Team Lead"),
-        alt.Tooltip("Start:T", title="Start", format="%a %d-%b-%Y"),
-        alt.Tooltip("End:T", title="End", format="%a %d-%b-%Y"),
-        alt.Tooltip("Effective_Hours:Q", title="Hours", format=",.1f"),
+        alt.Tooltip("Team_Name:N", title="Team"),
+        alt.Tooltip("Start:T", title="Start Date", format="%a %d-%b-%Y"),
+        alt.Tooltip("End:T", title="Delivery Date", format="%a %d-%b-%Y"),
+        alt.Tooltip("Effective_Hours:Q", title="Allocated Hours", format=",.1f"),
         alt.Tooltip("Coordination_Status:N", title="Status"),
     ]
 
     bars = alt.Chart(gantt_df).mark_bar(cornerRadius=3).encode(
-        y=alt.Y("RowLabel:N", sort=row_order, title=None, axis=alt.Axis(labelLimit=320)),
-        x=alt.X("Start:T", scale=x_scale, title="Date", axis=alt.Axis(format="%d-%b", labelAngle=-45)),
+        y=alt.Y("RowLabel:N", sort=row_order, title=None, axis=alt.Axis(labelLimit=340)),
+        x=alt.X("Start:T", scale=x_scale, title="Timeline", axis=alt.Axis(format="%d-%b", labelAngle=-45)),
         x2="EndPlus:T",
-        color=alt.Color(f"{color_col}:N", title="Legend"),
+        color=alt.Color(f"{color_by}:N", title="Team" if color_by == "Team_Name" else "Project Manager"),
         tooltip=tooltips,
     )
 
@@ -272,15 +312,14 @@ def render_gantt_chart(df: pd.DataFrame, label_mode: str = "project_task", hide_
 
 
 # ----------------------------------------------------------------------
-# 4. Daily Capacity & Bottleneck Engine
+# 4. Daily Team Capacity & Bottleneck Engine
 # ----------------------------------------------------------------------
 def compute_daily_team_load(
     tasks_df: pd.DataFrame,
-    teams_df: pd.DataFrame,
     team_name: str,
     start_timeline: datetime.date,
     num_weeks: int,
-    override_engineers: int,
+    engineers_count: int,
     hours_per_day: float,
     efficiency: float,
 ):
@@ -294,7 +333,8 @@ def compute_daily_team_load(
 
     team_tasks = tasks_df[tasks_df["Team_Name"] == team_name].copy()
     for _, row in team_tasks.iterrows():
-        if "مكتمل" in str(row.get("Coordination_Status", "")):
+        status_str = str(row.get("Coordination_Status", "")).lower()
+        if "completed" in status_str or "مكتمل" in status_str:
             continue
         s_date = row.get("Start_Date")
         e_date = row.get("End_Date")
@@ -308,7 +348,7 @@ def compute_daily_team_load(
             if s_date <= day <= e_date:
                 daily_demand[i] += daily_rate
 
-    daily_cap = round(override_engineers * hours_per_day * efficiency, 1)
+    daily_cap = round(engineers_count * hours_per_day * efficiency, 1)
     dem_list = [round(x, 1) for x in daily_demand]
     cap_list = [daily_cap] * num_days
     var_list = [round(daily_cap - d, 1) for d in dem_list]
@@ -317,47 +357,51 @@ def compute_daily_team_load(
 
 
 # ----------------------------------------------------------------------
-# 5. Load Live Data & Top Action Bar
+# 5. Load & Sync All Data
 # ----------------------------------------------------------------------
 try:
-    projects_df, teams_df, raw_tasks_df = load_planner_data(SPREADSHEET_ID)
+    projects_df, teams_df, raw_tasks_df, sync_df = load_all_synced_data(MASTER_SHEET_ID, PM_SHEETS)
 except Exception as e:
-    st.error(
-        f"⚠️ تعذر قراءة ملف Google Sheet. تأكد من أن الملف مشارك بصلاحية العرض (Anyone with the link: Viewer).\n\nالتفاصيل: {e}"
-    )
+    st.error(f"Failed to load data from Google Sheets. Ensure view access is enabled. Details: {e}")
     st.stop()
 
-top_c1, top_c2, top_c3 = st.columns([1.2, 1.8, 3])
+top_c1, top_c2, top_c3 = st.columns([1.3, 1.7, 3])
 with top_c1:
-    if st.button("🔄 تحديث البيانات (Refresh)", use_container_width=True):
-        load_planner_data.clear()
+    if st.button("🔄 Refresh & Sync All", use_container_width=True):
+        load_all_synced_data.clear()
         st.rerun()
 with top_c2:
-    st.link_button("📝 فتح Google Sheet لإدخال/تعديل المهام", SHEET_EDIT_URL, use_container_width=True)
+    st.link_button("🗂️ Open Master Database", build_edit_url(MASTER_SHEET_ID), use_container_width=True)
 with top_c3:
     st.caption(
-        f"🟢 متصل بـ ACKD_Resource_Planner_DB | المشاريع: {len(projects_df)} | الأفرقة: {len(teams_df)} | المهام المسجلة: {len(raw_tasks_df)}"
+        f"Synced {len(PM_SHEETS)} PM sheets | Projects: {len(projects_df)} | Teams: {len(teams_df)} | Total Tasks: {len(raw_tasks_df)}"
     )
 
-# Sidebar Global Settings
-st.sidebar.header("⚙️ إعدادات السعة والتحليل")
-hours_per_day = st.sidebar.number_input(
-    "ساعات العمل اليومية للمهندس", min_value=1.0, max_value=12.0, value=DEFAULT_HOURS_PER_DAY, step=0.5
-)
-efficiency = st.sidebar.slider("معامل الكفاءة (%)", 50, 100, int(DEFAULT_EFFICIENCY_PCT)) / 100.0
-start_timeline = st.sidebar.date_input("بداية أفق التحليل الزمني", value=datetime.date.today())
-num_weeks = st.sidebar.slider("عدد أسابيع التحليل (الأحد–الخميس)", 1, 12, 4)
+with st.expander("🔗 PM Sheets Sync Links & Status"):
+    st.dataframe(sync_df, use_container_width=True, hide_index=True)
+    link_cols = st.columns(len(PM_SHEETS))
+    for idx, (pm_label, cfg) in enumerate(PM_SHEETS.items()):
+        with link_cols[idx]:
+            st.link_button(f"📝 {pm_label}", build_edit_url(cfg["sheet_id"]), use_container_width=True)
 
-# Prepare enriched tasks
+# Sidebar Controls
+st.sidebar.header("⚙️ Capacity & Horizon Settings")
+hours_per_day = st.sidebar.number_input(
+    "Working Hours / Day", min_value=1.0, max_value=12.0, value=DEFAULT_HOURS_PER_DAY, step=0.5
+)
+efficiency = st.sidebar.slider("Efficiency Factor (%)", 50, 100, int(DEFAULT_EFFICIENCY_PCT)) / 100.0
+start_timeline = st.sidebar.date_input("Analysis Start Date", value=datetime.date.today())
+num_weeks = st.sidebar.slider("Analysis Horizon (Weeks, Sun–Thu)", 1, 12, 4)
+
 tasks_df = prepare_tasks_df(raw_tasks_df, projects_df, hours_per_day, efficiency)
 
-# Navigation Modes
+# Navigation
 view_mode = st.radio(
-    "اختر طريقة العرض:",
+    "Select View:",
     [
-        "🏢 نظرة تنفيذية شاملة (Executive Overview)",
-        "📁 متابعة المشاريع ومدراء المشاريع (PM & Deadlines)",
-        "👥 القدرة الاستيعابية للأفرقة (Team Capacity & Bottlenecks)",
+        "🏢 Executive Overview",
+        "📁 Projects & Delivery Schedule",
+        "👥 Teams Capacity & Bottlenecks",
     ],
     horizontal=True,
 )
@@ -368,26 +412,33 @@ st.markdown("---")
 # VIEW 1: Executive Overview
 # ======================================================================
 if view_mode.startswith("🏢"):
-    st.subheader("🏢 ملخص حالة المشاريع، التنسيق، والقدرة الاستيعابية")
+    st.subheader("🏢 Executive Overview — Delivery & Teams Capacity")
 
     total_tasks = len(tasks_df)
-    active_tasks = len(tasks_df[~tasks_df["Coordination_Status"].astype(str).str.contains("مكتمل", na=False)]) if total_tasks else 0
-    pending_coord = len(tasks_df[tasks_df["Coordination_Status"].astype(str).str.contains("مقترح|مراجعة", na=False)]) if total_tasks else 0
-    overdue_risk = len(tasks_df[tasks_df["Schedule_Health"].astype(str).str.contains("🚨|⚠️", na=False)]) if total_tasks else 0
+    active_df = (
+        tasks_df[~tasks_df["Coordination_Status"].astype(str).str.lower().str.contains("completed|مكتمل", na=False)]
+        if total_tasks
+        else tasks_df
+    )
+    risk_df = (
+        tasks_df[tasks_df["Schedule_Status"].astype(str).str.contains("🚨|⚠️", na=False)]
+        if total_tasks
+        else tasks_df
+    )
 
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("📁 إجمالي المشاريع", len(projects_df))
-    m2.metric("📌 المهام النشطة", active_tasks)
-    m3.metric("🤝 بانتظار اعتماد مدير الفريق", pending_coord)
-    m4.metric("🚨 تنبيهات المواعيد والتسليم", overdue_risk)
+    m1.metric("Total Projects", len(projects_df))
+    m2.metric("Active Tasks", len(active_df))
+    m3.metric("Engineering Teams", len(teams_df))
+    m4.metric("Schedule Alerts", len(risk_df))
 
-    st.markdown("### 📊 ملخص القدرة الاستيعابية للأفرقة العشرة خلال فترة التحليل")
+    st.markdown("### 📊 Teams Capacity Summary")
     summary_rows = []
     for _, t_row in teams_df.iterrows():
         t_name = t_row["Team_Name"]
         eng_cnt = int(t_row["Engineers_Count"])
         _, _, dem_l, cap_l, var_l = compute_daily_team_load(
-            tasks_df, teams_df, t_name, start_timeline, num_weeks, eng_cnt, hours_per_day, efficiency
+            tasks_df, t_name, start_timeline, num_weeks, eng_cnt, hours_per_day, efficiency
         )
         total_dem = sum(dem_l)
         total_cap = sum(cap_l)
@@ -395,128 +446,118 @@ if view_mode.startswith("🏢"):
         bottleneck_days = sum(1 for v in var_l if v < 0)
 
         summary_rows.append({
-            "الفريق / مدير الفريق": t_name,
-            "الفرع": t_row.get("Location", ""),
-            "عدد المهندسين": eng_cnt,
-            "السعة اليومية (ساعة)": cap_l[0] if cap_l else 0,
-            "إجمالي الطلب بالفترة (ساعة)": round(total_dem, 1),
-            "إجمالي السعة بالفترة (ساعة)": round(total_cap, 1),
-            "نسبة الإشغال (%)": util_pct,
-            "أيام العجز (Bottlenecks)": bottleneck_days,
+            "Team": t_name,
+            "Location": t_row.get("Location", ""),
+            "Engineers": eng_cnt,
+            "Daily Capacity (Hrs)": cap_l[0] if cap_l else 0.0,
+            "Period Demand (Hrs)": round(total_dem, 1),
+            "Period Capacity (Hrs)": round(total_cap, 1),
+            "Utilization (%)": util_pct,
+            "Bottleneck Days": bottleneck_days,
         })
 
-    summary_df = pd.DataFrame(summary_rows)
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
 
-    st.markdown("### 🗓️ المخطط الزمني لكافة المهام النشطة")
-    hide_comp_exec = st.checkbox("إخفاء المهام المكتملة", value=True, key="exec_hide_comp")
-    render_gantt_chart(tasks_df, label_mode="project_task", hide_completed=hide_comp_exec)
+    st.markdown("### 🗓️ Master Tasks Timeline")
+    hide_comp_exec = st.checkbox("Hide completed tasks", value=True, key="exec_hide_comp")
+    render_gantt_chart(tasks_df, color_by="Team_Name", hide_completed=hide_comp_exec)
 
 
 # ======================================================================
-# VIEW 2: Project Manager & Deadlines View
+# VIEW 2: Projects & Delivery Schedule
 # ======================================================================
 elif view_mode.startswith("📁"):
-    st.subheader("📁 متابعة مواعيد التسليم حسب مدير المشروع (PM) والمشروع")
+    st.subheader("📁 Projects & Task Delivery Schedule")
 
-    pm_list = ["الكل"] + sorted(projects_df["PM_Name"].dropna().unique().tolist())
-    f_col1, f_col2, f_col3 = st.columns([1.2, 1.8, 1])
-    with f_col1:
-        selected_pm = st.selectbox("👤 اختر مدير المشروع (PM):", pm_list)
-    with f_col2:
-        if selected_pm == "الكل":
-            avail_projects = projects_df
+    pm_options = ["All"] + list(PM_SHEETS.keys())
+    c1, c2, c3 = st.columns([1.3, 1.7, 1])
+    with c1:
+        sel_pm = st.selectbox("Project Manager:", pm_options)
+    with c2:
+        if sel_pm == "All":
+            proj_pool = projects_df
         else:
-            avail_projects = projects_df[projects_df["PM_Name"] == selected_pm]
-
-        proj_options = ["كافة المشاريع"] + [
-            f"{r['Project_Code']} — {r['Project_Name']}" for _, r in avail_projects.iterrows()
+            proj_pool = projects_df[projects_df["PM_Name"] == sel_pm]
+        proj_choices = ["All Projects"] + [
+            f"{r['Project_Code']} — {r['Project_Name']}" for _, r in proj_pool.iterrows()
         ]
-        selected_proj_label = st.selectbox("🏗️ اختر المشروع:", proj_options)
-    with f_col3:
-        hide_comp_pm = st.checkbox("إخفاء المكتمل", value=False, key="pm_hide_comp")
+        sel_proj = st.selectbox("Project:", proj_choices)
+    with c3:
+        hide_comp_pm = st.checkbox("Hide completed", value=False, key="pm_hide_comp")
 
-    filtered_tasks = tasks_df.copy()
-    if selected_pm != "الكل":
-        filtered_tasks = filtered_tasks[filtered_tasks["PM_Name"] == selected_pm]
-    if selected_proj_label != "كافة المشاريع":
-        sel_code = selected_proj_label.split(" — ")[0].strip()
-        filtered_tasks = filtered_tasks[filtered_tasks["Project_Code"] == sel_code]
+    filtered = tasks_df.copy()
+    if sel_pm != "All" and "PM_Name" in filtered.columns:
+        filtered = filtered[filtered["PM_Name"] == sel_pm]
+    if sel_proj != "All Projects" and "Project_Code" in filtered.columns:
+        p_code = sel_proj.split(" — ")[0].strip()
+        filtered = filtered[filtered["Project_Code"] == p_code]
 
-    st.markdown("#### 📋 سجل مهام المشاريع (قابل للتعديل المؤقت للمحاكاة)")
-    edited_pm_df = st.data_editor(
-        filtered_tasks,
-        key="pm_task_editor",
+    st.markdown("#### 📋 Task Schedule Register (What-If Simulation)")
+    edited_pm = st.data_editor(
+        filtered,
+        key="pm_editor",
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
     )
-    sim_pm_tasks = prepare_tasks_df(edited_pm_df, projects_df, hours_per_day, efficiency)
+    sim_pm = prepare_tasks_df(edited_pm, projects_df, hours_per_day, efficiency)
 
-    st.markdown("#### 🗓️ الجدول الزمني للمهام ومواعيد التسليم")
-    render_gantt_chart(sim_pm_tasks, label_mode="project_task", hide_completed=hide_comp_pm)
+    st.markdown("#### 🗓️ Task Delivery Gantt Chart")
+    render_gantt_chart(sim_pm, color_by="Team_Name", hide_completed=hide_comp_pm)
 
 
 # ======================================================================
-# VIEW 3: Team Capacity & Bottlenecks View
+# VIEW 3: Teams Capacity & Bottlenecks
 # ======================================================================
 elif view_mode.startswith("👥"):
-    st.subheader("👥 تحليل القدرة الاستيعابية والاختناقات لكل فريق")
+    st.subheader("👥 Teams Capacity & Daily Bottleneck Analysis")
 
-    team_names = teams_df["Team_Name"].dropna().tolist()
-    selected_team = st.selectbox("اختر الفريق / مدير الفريق:", team_names)
+    team_list = teams_df["Team_Name"].dropna().tolist()
+    sel_team = st.selectbox("Select Team:", team_list)
 
-    team_meta = teams_df[teams_df["Team_Name"] == selected_team].iloc[0]
-    default_eng = int(team_meta["Engineers_Count"])
+    t_meta = teams_df[teams_df["Team_Name"] == sel_team].iloc[0]
+    default_eng = int(t_meta["Engineers_Count"])
 
     c1, c2, c3 = st.columns([1.2, 1.2, 2.6])
     with c1:
-        override_eng = st.number_input(
-            "عدد المهندسين المتاحين (محاكاة):",
+        eng_val = st.number_input(
+            "Available Engineers (What-If):",
             min_value=0,
             max_value=200,
             value=default_eng,
-            key=f"eng_input_{selected_team}",
+            key=f"eng_cnt_{sel_team}",
         )
     with c2:
-        daily_cap_val = round(override_eng * hours_per_day * efficiency, 1)
-        st.metric("السعة اليومية المتاحة", f"{daily_cap_val} ساعة/يوم")
+        daily_cap_val = round(eng_val * hours_per_day * efficiency, 1)
+        st.metric("Daily Team Capacity", f"{daily_cap_val:.1f} hrs/day")
     with c3:
         st.info(
-            f"📍 **الفرع:** {team_meta.get('Location', '-')} | **المجموعة:** {team_meta.get('Department_Group', '-')} | **العدد الفعلي في الشيت:** {default_eng} مهندس"
+            f"**Team:** {sel_team} | **Location:** {t_meta.get('Location', '-')} | **Group:** {t_meta.get('Department_Group', '-')} | **Sheet Headcount:** {default_eng}"
         )
 
-    team_tasks_raw = tasks_df[tasks_df["Team_Name"] == selected_team].copy()
-    st.markdown("#### 📌 المهام المسندة لهذا الفريق من مدراء المشاريع (يمكن التعديل المؤقت للمحاكاة)")
-    edited_team_tasks = st.data_editor(
+    team_tasks_raw = tasks_df[tasks_df["Team_Name"] == sel_team].copy()
+    st.markdown("#### 📌 Assigned Team Tasks (What-If Simulation)")
+    edited_team = st.data_editor(
         team_tasks_raw,
-        key=f"team_editor_{selected_team}",
+        key=f"team_editor_{sel_team}",
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
     )
-    sim_team_tasks = prepare_tasks_df(edited_team_tasks, projects_df, hours_per_day, efficiency)
+    sim_team = prepare_tasks_df(edited_team, projects_df, hours_per_day, efficiency)
 
-    # Calculate daily load
     days, day_labels, dem_list, cap_list, var_list = compute_daily_team_load(
-        sim_team_tasks,
-        teams_df,
-        selected_team,
-        start_timeline,
-        num_weeks,
-        override_eng,
-        hours_per_day,
-        efficiency,
+        sim_team, sel_team, start_timeline, num_weeks, eng_val, hours_per_day, efficiency
     )
 
     short_days = [(day_labels[i], v) for i, v in enumerate(var_list) if v < 0]
     if short_days:
         worst = min(short_days, key=lambda x: x[1])
         st.warning(
-            f"⚠️ يوجد عجز في السعة خلال **{len(short_days)}** يوم عمل من أصل {len(days)}. أسوأ يوم: **{worst[0]}** ({worst[1]:.1f} ساعة)."
+            f"⚠️ {len(short_days)} bottleneck day(s) out of {len(days)} working days. Worst day: **{worst[0]}** ({worst[1]:.1f} hrs)."
         )
     else:
-        st.success("✅ السعة الاستيعابية كافية ولا توجد اختناقات خلال الفترة المحددة.")
+        st.success("✅ No capacity bottlenecks detected in the selected period.")
 
     results_df = pd.DataFrame({"Metric": ["Demand (Hrs)", "Capacity (Hrs)", "Variance (Surplus/Shortage)"]})
     for i, lbl in enumerate(day_labels):
@@ -541,14 +582,14 @@ elif view_mode.startswith("👥"):
     })
     chart_data["Color"] = np.where(chart_data["Variance"] >= 0, "#2ca02c", "#d62728")
 
-    st.markdown("#### 📉 مخطط الفائض والعجز اليومي (Daily Variance)")
+    st.markdown("#### 📉 Daily Variance Chart")
     var_chart = alt.Chart(chart_data).mark_bar().encode(
-        x=alt.X("Day:N", sort=day_labels, title="اليوم", axis=alt.Axis(labelAngle=-90)),
-        y=alt.Y("Variance:Q", title="الفائض / العجز (ساعة)"),
+        x=alt.X("Day:N", sort=day_labels, title="Day", axis=alt.Axis(labelAngle=-90)),
+        y=alt.Y("Variance:Q", title="Variance (Hrs)"),
         color=alt.Color("Color:N", scale=None),
         tooltip=["Day", "Variance", "Demand", "Capacity"],
     )
     st.altair_chart(var_chart, use_container_width=True)
 
-    st.markdown("#### 🗓️ الجدول الزمني لمهام الفريق حسب المشاريع")
-    render_gantt_chart(sim_team_tasks, label_mode="team_task", hide_completed=False)
+    st.markdown("#### 🗓️ Team Task Schedule")
+    render_gantt_chart(sim_team, color_by="PM_Name", hide_completed=False)
